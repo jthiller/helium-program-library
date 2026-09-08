@@ -45,3 +45,34 @@ mv keypairs.tar.gz migration-docker/data/
 Upload the resulting `migration.gpg` to the [`migration-service`](../migration-service) k8s secrets and the encrypted keypairs to S3.
 
 On migration day, upload `export.json`, `makers.json`, `makers-mobile.json` to S3 and merge the k8s PR. Seed the IoT and Mobile metadata databases via a port-forward to the oracle DB and then running the `hotspot-data-sink` seed command against `migration-service/export.json`.
+
+## Hotspot maker (manufacturer) attribution
+
+There is no `maker` field on `KeyToAssetV0` or `IotHotspotInfoV0`. The only on-chain
+link between a hotspot and the maker that manufactured it is the Metaplex collection
+of the hotspot's compressed NFT: `issue_entity_v0` mints every hotspot into
+`MakerV0.collection`, the PDA `["collection", maker]`. That collection is fixed for
+the life of a maker (`MakerV0.merkle_tree` is not — `update_maker_tree_v0` rotates it
+once a tree fills up), so `collection -> maker` is the mapping to key off of. Hotspots
+issued by `issue_data_only_entity_v0` land in the `DataOnlyConfigV0` collection and
+have no maker at all.
+
+The lookup for a single hotspot address (base58 entity key):
+
+1. `keyToAssetKey(daoKey(HNT_MINT), address)` → `KeyToAssetV0.asset` (the cNFT id).
+2. DAS `getAsset(asset)` → `grouping` entry with `group_key: "collection"`.
+3. Match that collection against `MakerV0.collection` → `MakerV0.name`.
+
+Step 2 needs a DAS-capable RPC (Helius etc.) — the cNFT lives in a merkle tree, not
+in a regular account.
+
+`iot-hotspots-by-maker` does this in bulk. Given a file of hotspot addresses (for
+example the active set from whatever liveness source you use) it emits a per-hotspot
+maker CSV plus a count by maker:
+
+```bash
+helium-admin iot-hotspots-by-maker -u <DAS_RPC_URL> -f active-hotspots.txt -o by-maker.csv
+```
+
+With no `-f` it instead pages every IOT maker collection and reports total hotspots
+issued per maker.
