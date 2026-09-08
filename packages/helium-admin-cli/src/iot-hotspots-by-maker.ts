@@ -21,6 +21,8 @@ import yargs from "yargs/yargs";
 const DATA_ONLY_MAKER_NAME = "Data Only";
 const UNKNOWN_MAKER_NAME = "Unknown";
 
+type Hotspot = { address: string; asset?: string };
+
 /**
  * There is no `maker` field on KeyToAssetV0 or IotHotspotInfoV0. The only
  * on-chain link between a hotspot and the maker that manufactured it is the
@@ -49,7 +51,7 @@ export async function run(args: any = process.argv) {
       alias: "f",
       type: "string",
       describe:
-        "File of hotspot addresses (base58 entity keys) to attribute, one per line or a JSON array. Omit to count every hotspot in every maker collection instead.",
+        "File of hotspots to attribute: newline delimited base58 addresses, a JSON array of them, or a CSV with an `address` header and an optional `asset` column. Supplying `asset` skips the key_to_asset lookup. Omit the flag to count every hotspot in every maker collection instead.",
     },
     out: {
       alias: "o",
@@ -107,7 +109,7 @@ export async function run(args: any = process.argv) {
       dao,
       url: argv.url,
       collectionToMaker,
-      addresses: readAddresses(argv.hotspots),
+      hotspots: readHotspots(argv.hotspots),
     });
     for (const [, maker] of rows) bump(maker);
     if (argv.out) {
@@ -152,15 +154,38 @@ export async function run(args: any = process.argv) {
   );
 }
 
-function readAddresses(file: string): string[] {
+/**
+ * Accepts a JSON array of addresses, a newline delimited list of addresses, or
+ * a CSV with an `address` header and an optional `asset` column. The warehouse
+ * already stores the cNFT id per hotspot in
+ * network.chain.iot_hotspot_inventory, so feeding `address,asset` in removes
+ * the key_to_asset round trip and leaves only the DAS calls.
+ */
+function readHotspots(file: string): Hotspot[] {
   const raw = fs.readFileSync(file, "utf-8").trim();
   if (raw.startsWith("[")) {
-    return JSON.parse(raw);
+    return (JSON.parse(raw) as string[]).map((address) => ({ address }));
   }
-  return raw
+
+  const lines = raw
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
+
+  const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
+  if (!header.includes("address")) {
+    return lines.map((address) => ({ address }));
+  }
+
+  const addressAt = header.indexOf("address");
+  const assetAt = header.indexOf("asset");
+  return lines.slice(1).map((line) => {
+    const cols = line.split(",").map((c) => c.trim());
+    return {
+      address: cols[addressAt],
+      asset: assetAt === -1 ? undefined : cols[assetAt] || undefined,
+    };
+  });
 }
 
 /**
@@ -169,35 +194,44 @@ function readAddresses(file: string): string[] {
  *   -> KeyToAssetV0.asset (the cNFT id)
  *   -> DAS getAssetBatch -> grouping "collection"
  *   -> MakerV0.collection -> maker name
+ *
+ * Hotspots that already carry an `asset` skip straight to the DAS step.
  */
 async function attributeHotspots({
   hemProgram,
   dao,
   url,
   collectionToMaker,
-  addresses,
+  hotspots,
 }: {
   hemProgram: Awaited<ReturnType<typeof initHem>>;
   dao: PublicKey;
   url: string;
   collectionToMaker: Map<string, string>;
-  addresses: string[];
+  hotspots: Hotspot[];
 }): Promise<[string, string][]> {
   const rows: [string, string][] = [];
 
-  for (const batch of chunks(addresses, 1000)) {
-    const ktaKeys = batch.map((address) => keyToAssetKey(dao, address)[0]);
-    const ktas = await hemProgram.account.keyToAssetV0.fetchMultiple(ktaKeys);
-
+  for (const batch of chunks(hotspots, 1000)) {
     const assetToAddress = new Map<string, string>();
-    ktas.forEach((kta, i) => {
-      if (kta) {
-        assetToAddress.set(kta.asset.toBase58(), batch[i]);
-      } else {
-        // No key_to_asset means the address was never onboarded to Solana.
-        rows.push([batch[i], UNKNOWN_MAKER_NAME]);
-      }
-    });
+    for (const { address, asset } of batch) {
+      if (asset) assetToAddress.set(asset, address);
+    }
+
+    const needsLookup = batch.filter((h) => !h.asset);
+    if (needsLookup.length > 0) {
+      const ktas = await hemProgram.account.keyToAssetV0.fetchMultiple(
+        needsLookup.map((h) => keyToAssetKey(dao, h.address)[0]),
+      );
+      ktas.forEach((kta, i) => {
+        if (kta) {
+          assetToAddress.set(kta.asset.toBase58(), needsLookup[i].address);
+        } else {
+          // No key_to_asset means the address was never onboarded to Solana.
+          rows.push([needsLookup[i].address, UNKNOWN_MAKER_NAME]);
+        }
+      });
+    }
 
     const assets =
       (await getAssetBatch(
@@ -224,7 +258,7 @@ async function attributeHotspots({
       if (!seen.has(address)) rows.push([address, UNKNOWN_MAKER_NAME]);
     }
 
-    console.error(`Attributed ${rows.length}/${addresses.length}`);
+    console.error(`Attributed ${rows.length}/${hotspots.length}`);
   }
 
   return rows;

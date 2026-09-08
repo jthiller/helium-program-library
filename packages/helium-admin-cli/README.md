@@ -66,13 +66,47 @@ The lookup for a single hotspot address (base58 entity key):
 Step 2 needs a DAS-capable RPC (Helius etc.) — the cNFT lives in a merkle tree, not
 in a regular account.
 
-`iot-hotspots-by-maker` does this in bulk. Given a file of hotspot addresses (for
-example the active set from whatever liveness source you use) it emits a per-hotspot
-maker CSV plus a count by maker:
+`iot-hotspots-by-maker` does this in bulk. It takes a file of hotspots — newline
+delimited base58 addresses, a JSON array of them, or a CSV with an `address` header
+and an optional `asset` column — and emits a per-hotspot maker CSV plus a count by
+maker. With no `-f` it instead pages every IOT maker collection and reports total
+hotspots issued per maker.
 
-```bash
-helium-admin iot-hotspots-by-maker -u <DAS_RPC_URL> -f active-hotspots.txt -o by-maker.csv
+### Active hotspots by maker, end to end
+
+Step 1 is the active set. The warehouse already holds both the liveness feed and the
+cNFT id per hotspot, so exporting `address,asset` removes the `key_to_asset` lookups
+and leaves only the DAS calls. The liveness feed lands one batch per UTC day and the
+newest batch can be mid-ingest, so anchor on the newest day that actually landed a
+full batch rather than on `max(day)` or on wall clock:
+
+```sql
+WITH day_counts AS (
+  SELECT date_trunc('day', timestamp) AS day, count(*) AS n
+  FROM network.iot.packet_router_liveness
+  WHERE timestamp >= CURRENT_DATE - INTERVAL '10' DAY
+  GROUP BY 1
+), data_through AS (
+  SELECT max(day) AS day FROM day_counts
+  WHERE n >= 0.5 * (SELECT max(n) FROM day_counts)
+), active AS (
+  SELECT DISTINCT gateway
+  FROM network.iot.packet_router_liveness
+  WHERE timestamp >= (SELECT day FROM data_through)
+    AND timestamp <  (SELECT day FROM data_through) + INTERVAL '1' DAY
+)
+SELECT a.gateway AS address, i.asset
+FROM active a
+LEFT JOIN network.chain.iot_hotspot_inventory i ON i.pub_key = a.gateway
+WHERE i.asset IS NOT NULL
 ```
 
-With no `-f` it instead pages every IOT maker collection and reports total hotspots
-issued per maker.
+Step 2 attributes them. At ~144k active hotspots this is ~145 `getAssetBatch` calls:
+
+```bash
+helium-admin iot-hotspots-by-maker -u <DAS_RPC_URL> -f active-hotspots.csv -o by-maker.csv
+```
+
+Gateways in the liveness feed with no row in `network.chain.iot_hotspot_inventory`
+were never onboarded as IOT entities on Solana and cannot be attributed; report them
+as their own bucket rather than dropping them.
